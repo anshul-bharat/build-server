@@ -185,9 +185,9 @@ init_file_times :: proc() {
 
 check_files :: proc() {
 	close_app := false
-	i := 0
+	// i := 0
 	for close_app == false {
-		i += 1
+		// i += 1
 		files := [dynamic]string{}
 		defer delete(files)
 
@@ -215,9 +215,9 @@ check_files :: proc() {
 
 		time.sleep(time.Second)
 
-		 if (i > 20) {
-			return
-		}
+		// if (i > 20) {
+		// 	return
+		// }
 	}
 }
 
