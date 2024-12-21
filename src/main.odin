@@ -3,6 +3,8 @@ package main
 import "core:c/libc"
 import "core:fmt"
 import "core:log"
+import "core:math"
+import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -12,45 +14,76 @@ import "core:time"
 import "http"
 
 WATCHED_FILES: map[string]os.File_Time
-COMMANDS: map[string][dynamic]string
+COMMANDS: map[string]([dynamic]string)
 
 start_server := false
+server_thread: ^thread.Thread = nil
+stop_server := false
 requires_reload := false
 
 main :: proc() {
-	files, err := filepath.glob("*")
+	when ODIN_DEBUG {
+		context.logger = log.create_console_logger()
+		defer log.destroy_console_logger(context.logger)
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
 
-	COMMANDS = generate_agrs_map()
+		defer {
 
-	context.logger = log.create_console_logger()
-
-	if err != filepath.Match_Error.None {
-		log.error("Something went wrong!, cannot read files")
-		return
-	}
-
-	for file in files {
-		file_time, err := os.last_write_time_by_name(file)
-		if err != os.ERROR_NONE {
-			log.errorf("Cannot read: {}", file)
-			return
+			fmt.println("Exiting")
+			if len(track.allocation_map) > 0 {
+				fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					fmt.eprintf("- %p @ %v\n", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
 		}
-
-		WATCHED_FILES[file] = file_time
 	}
+
+	_main()
+}
+
+_main :: proc() {
+
+	WATCHED_FILES = map[string]os.File_Time{}
+	COMMANDS = map[string]([dynamic]string){}
+
+	defer {
+		for k, v in WATCHED_FILES {
+			delete(k)
+		}
+		delete(WATCHED_FILES)
+		for k, v in COMMANDS {
+			delete(v)
+		}
+		delete(COMMANDS)
+	}
+
+	generate_agrs_map(&COMMANDS)
 
 	if start_server {
-		t := thread.create(start_web_server)
-		if t != nil {
-			t.init_context = context
-			t.user_index = 0
-			thread.start(t)
+		server_thread = thread.create(start_web_server)
+		if server_thread != nil {
+			server_thread.init_context = context
+			server_thread.user_index = 0
+			thread.start(server_thread)
 		}
 	}
 
 	log.info("Build Server Started")
-
+	init_file_times()
 	check_files()
+	stop_server = true
+	thread.join(server_thread)
+	thread.destroy(server_thread)
 }
 
 start_web_server :: proc(t: ^thread.Thread) {
@@ -60,24 +93,29 @@ start_web_server :: proc(t: ^thread.Thread) {
 
 	assert(len(COMMANDS["-s"]) == 1, "No webserver directory specified")
 
-	server := http.Server {
-		public_dir         = filepath.join({os.get_current_directory(), COMMANDS["-s"][0]}),
-		views_dir          = os.get_current_directory(),
-		response_modifiers = {},
-	}
+	server := new(http.Server)
+	defer free(server)
 
-	http.init_server(&server)
+	server.public_dir = filepath.join(
+		{os.get_current_directory(context.temp_allocator), COMMANDS["-s"][0]},
+		context.temp_allocator,
+	)
+	server.views_dir = os.get_current_directory(context.temp_allocator)
+	server.response_modifiers = {}
+	defer delete(server.response_modifiers)
+	http.init_server(server)
 
 	modifier: http.ResponseModifier_Proc = proc(request: ^http.Request, response: ^http.Response) {
 		if response.headers["Content-Type"] == http.CONTENT_TYPES[".html"] {
 			if r := response.varient.(^http.TextResponse); r != nil {
-				r.body = strings.join({r.body, JAVASCRIPT_ATTACHMENT}, "")
+				r.body = strings.join({r.body, JAVASCRIPT_ATTACHMENT}, "", context.temp_allocator)
 			}
 		}
 	}
-	append(&server.response_modifiers, modifier)
+	append(&(server.response_modifiers), modifier)
 
 	server.route_map = map[string]http.Route_Proc{}
+	defer delete(server.route_map)
 	server.route_map["/ws"] = proc(request: ^http.Request) -> ^http.Response {
 		response := http.new_text_response()
 		response.headers["Content-Type"] = http.CONTENT_TYPES[".json"]
@@ -92,7 +130,7 @@ start_web_server :: proc(t: ^thread.Thread) {
 	}
 
 
-	http.serve(&server)
+	http.serve(server, proc() -> bool {return stop_server == false})
 }
 
 Walk_Proc :: proc(
@@ -100,91 +138,136 @@ Walk_Proc :: proc(
 	in_err: os.Error,
 	user_data: rawptr,
 ) -> (
-	err: os.Error,
-	skip_dir: bool,
+	err: os.Error = nil,
+	skip_dir: bool = false,
 ) {
+
+	relative_path, _ := filepath.rel(
+		os.get_current_directory(context.temp_allocator),
+		info.fullpath,
+		context.temp_allocator,
+	)
+	relative_path, _ = filepath.to_slash(relative_path, context.temp_allocator)
+	// fmt.println("# ",info.fullpath)
+	if (should_call_handler(relative_path) == false) {
+		return
+	}
+
 	if info.is_dir == false {
 		files_list := transmute(^[dynamic]string)user_data
-		output, _ := strings.replace_all(
-			info.fullpath,
-			os.get_current_directory(),
-			"",
-			context.temp_allocator,
-		)
-		output, _ = strings.replace_all(output, "\\", "/", context.temp_allocator)
-		output, _ = strings.replace(output, "/", "", 1, context.temp_allocator)
-		append_elem(files_list, output)
+		// append_elem(files_list, relative_path)
+		filename, err := strings.clone(relative_path)
+		// defer delete(filename)
+		if (err == nil) {
+			append_elem(files_list, filename)
+		}
 	}
-	return nil, false
+
+	return
+}
+
+init_file_times :: proc() {
+	files := [dynamic]string{}
+
+	for root in COMMANDS["-r"] {
+		filepath.walk(root, Walk_Proc, &files)
+	}
+
+	for file in files {
+		file_time := os.last_write_time_by_name(file) or_continue
+		WATCHED_FILES[file] = file_time
+	}
+
+	delete(files)
 }
 
 check_files :: proc() {
+	close_app := false
+	// i := 0
+	for close_app == false {
+		// i += 1
+		files := [dynamic]string{}
+		defer delete(files)
 
-	for true {
-		files: [dynamic]string
-		filepath.walk("./", Walk_Proc, &files)
-		for file in files {
-			file_time := os.last_write_time_by_name(file) or_continue
-
-			new_file := file in WATCHED_FILES
-			if new_file == false {
-				WATCHED_FILES[file] = file_time
-				change_handler(file)
-				break
-			}
-
-			last_update_time := WATCHED_FILES[file]
-			if last_update_time < file_time {
-				WATCHED_FILES[file] = file_time
-				change_handler(file)
-			}
-
+		skip := false
+		for root in COMMANDS["-r"] {
+			filepath.walk(root, Walk_Proc, &files)
 		}
-		delete(files)
+
+		for filename in files {
+			file_time := os.last_write_time_by_name(filename) or_continue
+
+			is_old_file := filename in WATCHED_FILES
+			if is_old_file == false || WATCHED_FILES[filename] < file_time {
+				skip = true
+				change_handler(filename)
+				// fmt.printfln("{} : {} : {}", filename, WATCHED_FILES[filename], file_time)
+			}
+
+			WATCHED_FILES[filename] = file_time
+
+			delete(filename)
+		}
+
+		free_all(context.temp_allocator)
+
 		time.sleep(time.Second)
+
+		// if (i > 20) {
+		// 	return
+		// }
+	}
+}
+
+should_call_handler :: proc(filepath: string) -> bool {
+	// if true {
+	// 	return true
+	// }
+	for pattern in COMMANDS["-r"] {
+		if strings.contains(filepath, pattern) == false {
+			return false
+		}
 	}
 
+	for pattern in COMMANDS["-i"] {
+		if strings.contains(filepath, pattern) {
+			return false
+		}
+	}
+
+	should_call := false
+	if len(COMMANDS["-w"]) == 0 {
+		should_call = true
+	} else {
+		for pattern in COMMANDS["-w"] {
+			if strings.contains(filepath, pattern) {
+				should_call = true
+				break
+			}
+		}
+	}
+
+	return should_call
 }
 
 change_handler :: proc(filename: string) {
-	for pattern in COMMANDS["-i"] {
-		if strings.contains(filename, pattern) {
-			return
-		}
-	}
-
-	should_call_handler := false
-	if len(COMMANDS["-w"]) == 0 {
-		should_call_handler = true
-	}
-
-	for pattern in COMMANDS["-w"] {
-		if strings.contains(filename, pattern) {
-			should_call_handler = true
-			break
-		}
-	}
-
-	if should_call_handler == true {
-		log.infof("Updated: {}", filename)
-		for command, i in COMMANDS["-x"] {
-			cmd: cstring = strings.clone_to_cstring(command)
-			libc.system(cmd)
-			log.info("************************")
-			requires_reload = true
-		}
+	fmt.printfln("Updated: {}", filename)
+	for command, i in COMMANDS["-x"] {
+		cmd: cstring = strings.clone_to_cstring(command, context.temp_allocator)
+		libc.system(cmd)
+		requires_reload = true
+		free_all(context.temp_allocator)
 	}
 }
 
-generate_agrs_map :: proc() -> map[string][dynamic]string {
+generate_agrs_map :: proc(args_map: ^map[string][dynamic]string) {
 	args := os.args
 
-	args_map: map[string][dynamic]string
 	args_map["-x"] = {}
-	args_map["-i"] = {}
+	args_map["-i"] = {"/.git"}
 	args_map["-w"] = {}
 	args_map["-s"] = {}
-
+	args_map["-r"] = {}
 
 	is_error := true
 
@@ -196,6 +279,10 @@ generate_agrs_map :: proc() -> map[string][dynamic]string {
 		} else if strings.has_prefix(arg, "-i=") {
 			cmd := strings.trim_prefix(arg, "-i=")
 			append(&args_map["-i"], cmd)
+			is_error = false
+		} else if strings.has_prefix(arg, "-r=") {
+			cmd := strings.trim_prefix(arg, "-r=")
+			append(&args_map["-r"], cmd)
 			is_error = false
 		} else if strings.has_prefix(arg, "-w=") {
 			cmd := strings.trim_prefix(arg, "-w=")
@@ -217,7 +304,10 @@ generate_agrs_map :: proc() -> map[string][dynamic]string {
 		)
 	}
 
-	return args_map
+	if (len(args_map["-r"]) == 0) {
+		append(&args_map["-r"], "./")
+	}
+
 }
 
 JAVASCRIPT_ATTACHMENT := `

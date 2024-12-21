@@ -1,1 +1,1 @@
-odin.exe run src -out:build-server.exe -o:speed -- -s="src" -x="echo changed" -w="src" 
+odin.exe run src -debug -out:build-server.exe -o:speed -- -x="echo changed" -i=".git" -r="src" -s="src"

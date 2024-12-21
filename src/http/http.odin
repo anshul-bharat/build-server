@@ -147,7 +147,7 @@ init_server :: proc(server: ^Server) {
 	g_http_server = server
 }
 
-serve :: proc(server: ^Server) {
+serve :: proc(server: ^Server, keep_running: proc() -> bool = nil) {
 	if server.views_dir != "" && os2.exists(server.views_dir) == false {
 		log.panic("Views directory does not exists: ", server.views_dir)
 	}
@@ -167,40 +167,74 @@ serve :: proc(server: ^Server) {
 
 	log.info("Listening on port: ", server.port)
 
-	for {
+	for keep_running == nil || keep_running() {
 		log.info("Waiting for connection")
 
 		request := Request{}
+		defer {
+			for k, v in request.headers {
+				delete(k)
+				delete(v)
+			}
+			delete(request.headers)
+			delete(request.method)
+			delete(request.path)
+		}
 		accept(server, &request)
 
 		log.info("Route: ", request.path)
 
 		if server.route_map[request.path] != nil {
 			response := server.route_map[request.path](&request)
+			defer {
+				// for k, v in response.headers {
+				// 	delete(k)
+				// 	delete(v)
+				// }
+				delete(response.headers)
+				free(response)
+			}
 			switch r in response.varient {
 			case ^TextResponse:
 				send(&request, r)
 			case ^BinaryResponse:
 				send(&request, r)
 			}
-		} else if os2.exists(filepath.join({server.public_dir, request.path})) &&
-		   os2.is_file(filepath.join({server.public_dir, request.path})) {
-			ext, _ := strings.to_lower(filepath.ext(request.path))
+		} else if os2.exists(filepath.join({server.public_dir, request.path}, context.temp_allocator)) &&
+		   os2.is_file(filepath.join({server.public_dir, request.path}, context.temp_allocator)) {
+			ext, _ := strings.to_lower(filepath.ext(request.path), context.temp_allocator)
 			switch (ext) {
 			case ".txt", ".html", ".xml", ".css", ".js":
 				{
 					response := create_text_file_response(request.path)
-					defer free(response)
+					// defer free(response)
+					defer {
+						// for k, v in response.headers {
+						// 	delete(k)
+						// 	delete(v)
+						// }
+						delete(response.headers)
+						// delete(response.body)
+						free(response)
+					}
 					send(&request, response)
 				}
 			case:
 				response := create_binary_response(request.path)
-				defer free(response)
+				// defer free(response)
+				defer {
+					delete(response.headers)
+					// delete(response.body)
+					free(response)
+				}
 				send(&request, response)
 			}
 		} else {
 			response := new_text_response()
-			defer free(response)
+			defer {
+				delete(response.headers)
+				free(response)
+			}
 			response.status = .NOT_FOUND
 			response.body = "<h1> Error: Resource not found </h1>"
 			send(&request, response)
@@ -211,7 +245,7 @@ serve :: proc(server: ^Server) {
 }
 
 create_template_response :: proc(name: string) -> ^TextResponse {
-	path := filepath.join({g_http_server.views_dir, name})
+	path := filepath.join({g_http_server.views_dir, name}, context.temp_allocator)
 
 	response := new(TextResponse)
 	response.status = .OK
@@ -224,8 +258,8 @@ create_template_response :: proc(name: string) -> ^TextResponse {
 }
 
 create_binary_response :: proc(name: string) -> ^BinaryResponse {
-	path := filepath.join({g_http_server.public_dir, name})
-	ext, _ := strings.to_lower(filepath.ext(name))
+	path := filepath.join({g_http_server.public_dir, name}, context.temp_allocator)
+	ext, _ := strings.to_lower(filepath.ext(name), context.temp_allocator)
 
 	response := new_binary_response()
 	response.headers["Content-Type"] = CONTENT_TYPES[ext]
@@ -235,7 +269,7 @@ create_binary_response :: proc(name: string) -> ^BinaryResponse {
 }
 
 create_text_file_response :: proc(name: string) -> ^TextResponse {
-	path := filepath.join({g_http_server.public_dir, name})
+	path := filepath.join({g_http_server.public_dir, name}, context.temp_allocator)
 	ext, _ := strings.to_lower(filepath.ext(name))
 
 	response := new_text_response()
@@ -274,6 +308,8 @@ accept :: proc(server: ^Server, request: ^Request) {
 read :: proc(request: ^Request) {
 	bytes_recieved := [1024]u8{}
 	bytes_buffer: bytes.Buffer
+	defer bytes.buffer_destroy(&bytes_buffer)
+
 	for {
 		length, err := net.recv_tcp(request.connection.client_socket, bytes_recieved[:])
 		// assert(err == nil, "cannot recieve from socket")
@@ -294,39 +330,44 @@ read :: proc(request: ^Request) {
 		request.raw = ""
 	}
 
-	parts := strings.split(request.raw, "\r\n\r\n")
+	parts := strings.split(request.raw, "\r\n\r\n", context.temp_allocator)
 	assert(len(parts) > 0, "Request headers missing!")
 
 	if len(parts) == 2 {
 		request.body = parts[1]
 	}
 
-	header_parts := strings.split(parts[0], "\n")
-	line_1 := strings.split(header_parts[0], " ")
+	header_parts := strings.split(parts[0], "\n", context.temp_allocator)
+	line_1 := strings.split(header_parts[0], " ", context.temp_allocator)
 	if len(line_1) < 2 {
 		log.error("Invalid request")
 	}
-	request.path = line_1[1]
-	request.method = line_1[0]
+	request.path, _ = strings.clone(line_1[1])
+	request.method, _ = strings.clone(line_1[0])
 
 	for header_part, i in header_parts {
 		if i == 0 {
 			continue
 		}
 
-		key_value := strings.split(header_part, ": ")
+		key_value := strings.split(header_part, ": ", context.temp_allocator)
 		for part, j in key_value {
 			key_value[j] = strings.trim_space(part)
 		}
 
-		request.headers[key_value[0]] = key_value[1]
+		key, _ := strings.clone(key_value[0])
+		value, _ := strings.clone(key_value[1])
+		request.headers[key] = value
 	}
+
+	// free_all(context.temp_allocator)
 }
 
 send :: proc(request: ^Request, response: ^Response) {
 	modify_response(request, response)
 
 	response_buffer: bytes.Buffer
+	defer bytes.buffer_destroy(&response_buffer)
 
 	bytes.buffer_write_string(&response_buffer, "HTTP/1.1 ")
 	switch response.status {
@@ -372,7 +413,7 @@ close :: proc(request: ^Request) {
 }
 
 get_file_contents :: proc(path: string) -> string {
-	return strings.clone_from_bytes(get_file_bytes(path))
+	return strings.clone_from_bytes(get_file_bytes(path), context.temp_allocator)
 }
 
 get_file_bytes :: proc(path: string) -> []byte {
