@@ -241,6 +241,7 @@ serve :: proc(server: ^Server, keep_running: proc() -> bool = nil) {
 		}
 
 		close(&request)
+		free_all(context.temp_allocator)
 	}
 }
 

@@ -94,13 +94,15 @@ start_web_server :: proc(t: ^thread.Thread) {
 	assert(len(COMMANDS["-s"]) == 1, "No webserver directory specified")
 
 	server := new(http.Server)
-	defer free(server)
-
+	defer {
+		delete(server.views_dir)
+		delete(server.public_dir)
+		free(server)
+	}
 	server.public_dir = filepath.join(
 		{os.get_current_directory(context.temp_allocator), COMMANDS["-s"][0]},
-		context.temp_allocator,
 	)
-	server.views_dir = os.get_current_directory(context.temp_allocator)
+	server.views_dir = os.get_current_directory()
 	server.response_modifiers = {}
 	defer delete(server.response_modifiers)
 	http.init_server(server)
@@ -183,9 +185,9 @@ init_file_times :: proc() {
 
 check_files :: proc() {
 	close_app := false
-	// i := 0
+	i := 0
 	for close_app == false {
-		// i += 1
+		i += 1
 		files := [dynamic]string{}
 		defer delete(files)
 
@@ -213,9 +215,9 @@ check_files :: proc() {
 
 		time.sleep(time.Second)
 
-		// if (i > 20) {
-		// 	return
-		// }
+		 if (i > 20) {
+			return
+		}
 	}
 }
 
