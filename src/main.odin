@@ -25,6 +25,7 @@ main :: proc() {
 	when ODIN_DEBUG {
 		context.logger = log.create_console_logger()
 		defer log.destroy_console_logger(context.logger)
+		
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
 		context.allocator = mem.tracking_allocator(&track)
@@ -61,6 +62,7 @@ _main :: proc() {
 			delete(k)
 		}
 		delete(WATCHED_FILES)
+		
 		for k, v in COMMANDS {
 			delete(v)
 		}
@@ -78,9 +80,11 @@ _main :: proc() {
 		}
 	}
 
-	log.info("Build Server Started")
 	init_file_times()
+	log.info("Build Server Started")
+	
 	check_files()
+	
 	stop_server = true
 	thread.join(server_thread)
 	thread.destroy(server_thread)
@@ -108,7 +112,7 @@ start_web_server :: proc(t: ^thread.Thread) {
 	http.init_server(server)
 
 	modifier: http.ResponseModifier_Proc = proc(request: ^http.Request, response: ^http.Response) {
-		if response.headers["Content-Type"] == http.CONTENT_TYPES[".html"] {
+		if response.headers["Content-Type"] == http.CONTENT_TYPES[http.FILE_TYPE_IDS.HTML] {
 			if r := response.varient.(^http.TextResponse); r != nil {
 				r.body = strings.join({r.body, JAVASCRIPT_ATTACHMENT}, "", context.temp_allocator)
 			}
@@ -120,7 +124,7 @@ start_web_server :: proc(t: ^thread.Thread) {
 	defer delete(server.route_map)
 	server.route_map["/ws"] = proc(request: ^http.Request) -> ^http.Response {
 		response := http.new_text_response()
-		response.headers["Content-Type"] = http.CONTENT_TYPES[".json"]
+		response.headers["Content-Type"] = http.CONTENT_TYPES[http.FILE_TYPE_IDS.JSON]
 		if requires_reload == true {
 			response.body = `{"reload": true}`
 			requires_reload = false
@@ -150,16 +154,14 @@ Walk_Proc :: proc(
 		context.temp_allocator,
 	)
 	relative_path, _ = filepath.to_slash(relative_path, context.temp_allocator)
-	// fmt.println("# ",info.fullpath)
+	
 	if (should_call_handler(relative_path) == false) {
 		return
 	}
 
 	if info.is_dir == false {
 		files_list := transmute(^[dynamic]string)user_data
-		// append_elem(files_list, relative_path)
 		filename, err := strings.clone(relative_path)
-		// defer delete(filename)
 		if (err == nil) {
 			append_elem(files_list, filename)
 		}
@@ -203,7 +205,6 @@ check_files :: proc() {
 			if is_old_file == false || WATCHED_FILES[filename] < file_time {
 				skip = true
 				change_handler(filename)
-				// fmt.printfln("{} : {} : {}", filename, WATCHED_FILES[filename], file_time)
 			}
 
 			WATCHED_FILES[filename] = file_time
@@ -222,9 +223,6 @@ check_files :: proc() {
 }
 
 should_call_handler :: proc(filepath: string) -> bool {
-	// if true {
-	// 	return true
-	// }
 	for pattern in COMMANDS["-r"] {
 		if strings.contains(filepath, pattern) == false {
 			return false
@@ -302,7 +300,7 @@ generate_agrs_map :: proc(args_map: ^map[string][dynamic]string) {
 
 	if is_error == true {
 		log.panic(
-			"Invalid args: Usage > build-server -x=\"{Execute command}\" -w=\"{Watch files pattern}\" -i=\"{Ignore files pattern}\" ",
+			"Invalid args: Usage > build-server -x=\"{Execute command}\" -w=\"{Watch files pattern}\" -i=\"{Ignore files pattern}\" -r=\"{Root dir}\" -s=\"{Webroot}\" ",
 		)
 	}
 

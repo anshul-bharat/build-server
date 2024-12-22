@@ -11,7 +11,6 @@ import "core:strings"
 g_http_server: ^Server
 
 Route_Proc :: proc(_: ^Request) -> ^Response
-// ResponseModifier_Proc :: prco(_: ^Request, _:^Response) -> ^Response
 ResponseModifier_Proc :: proc(_: ^Request, __: ^Response)
 
 Server :: struct {
@@ -38,6 +37,16 @@ Request :: struct {
 	raw:        string,
 }
 
+delete_request :: proc(request: ^Request) {
+			for k, v in request.headers {
+				delete(k)
+				delete(v)
+			}
+			delete(request.headers)
+			delete(request.method)
+			delete(request.path)
+}
+
 RequestHeaders :: struct {
 	host:                      string,
 	connection:                string,
@@ -60,11 +69,6 @@ RequestHeaders :: struct {
 	sec_websocket_version:     string,
 	sec_websocket_key:         string,
 }
-
-// HttpResponse :: union {
-// 	HttpTextResponse,
-// 	HttpBinaryResponse,
-// }
 
 Response :: struct {
 	status:  Status,
@@ -89,6 +93,11 @@ new_text_response :: proc() -> ^TextResponse {
 	return response
 }
 
+delete_text_response :: proc(response: ^TextResponse) {
+	delete(response.headers)
+	free(response)
+}
+
 BinaryResponse :: struct {
 	using response: Response,
 	body:           []byte,
@@ -103,44 +112,92 @@ new_binary_response :: proc() -> ^BinaryResponse {
 	return response
 }
 
+delete_binary_response :: proc(response: ^BinaryResponse) {
+	delete(response.headers)
+	free(response)
+}
+
+delete_response :: proc(response: ^Response) {
+	switch res in response.varient {
+		case ^TextResponse:
+			delete_text_response(res)
+		case ^BinaryResponse:
+			delete_binary_response(res)
+	}
+}
+
 Status :: enum {
 	OK        = 200,
 	NOT_FOUND = 404,
 }
 
-// httpResponseHeaders :: struct {
-// 	status:                      HttpStatus,
-// 	access_control_allow_origin: string,
-// 	connection:                  string,
-// 	content_encoding:            string,
-// 	content_type:                string,
-// 	date:                        string,
-// 	etag:                        string,
-// 	keep_alive:                  string,
-// 	last_modified:               string,
-// 	server:                      string,
-// 	set_cookie:                  string,
-// 	transfer_encoding:           string,
-// 	vary:                        string,
-// 	x_backend_server:            string,
-// 	x_cache_info:                string,
-// 	x_kuma_revision:             string,
-// 	x_frame_options:             string,
-// }
+FILE_TYPE_IDS :: enum {
+	HTML,
+	XML,
+	TEXT,
+	CSS,
+	JS,
+	BMP,
+	JPG,
+	JPEG,
+	PNG,
+	GIF,
+	WEBP,
+	SVG,
+	JSON,
+	BINARY
+}
 
-CONTENT_TYPES := map[string]string {
-	".html" = "text/html; charset=utf-8",
-	".css"  = "text/css; charset=utf-8",
-	".js"   = "application/javascript; charset=utf-8",
-	".bmp"  = "image/bmp",
-	".jpg"  = "image/jpg",
-	".jpeg" = "image/jpeg",
-	".png"  = "image/png",
-	".gif"  = "image/gif",
-	".webp" = "image/webp",
-	".svg"  = "image/svg-xml",
-	".json" = "application/json",
-	""      = "application/octet-stream",
+FILE_EXTENSTIONS := map[FILE_TYPE_IDS]string {
+	.HTML   = "html",
+	.XML   = "xml",
+	.TEXT   = "txt",
+	.CSS    = "css",
+	.JS     = "js",
+	.BMP    = "bmp",
+	.JPG    = "jpg",
+	.JPEG   = "jpeg",
+	.PNG    = "png",
+	.GIF    = "gif",
+	.WEBP   = "webp",
+	.SVG    = "svg",
+	.JSON   = "json",
+	.BINARY = "bin",
+}
+
+CONTENT_TYPES := map[FILE_TYPE_IDS]string {
+	.HTML   = "text/html; charset=utf-8",
+	.XML   = "text/xml; charset=utf-8",
+	.TEXT   = "text/xml; charset=utf-8",
+	.CSS    = "text/css; charset=utf-8",
+	.JS     = "application/javascript; charset=utf-8",
+	.BMP    = "image/bmp",
+	.JPG    = "image/jpg",
+	.JPEG   = "image/jpeg",
+	.PNG    = "image/png",
+	.GIF    = "image/gif",
+	.WEBP   = "image/webp",
+	.SVG    = "image/svg-xml",
+	.JSON   = "application/json",
+	.BINARY = "application/octet-stream",
+}
+
+get_filetype :: proc(filename: string) -> FILE_TYPE_IDS {
+	ext, _ := strings.to_lower(filepath.ext(filename), context.temp_allocator)
+	ext, _ = strings.replace_all(ext, ".", "", context.temp_allocator)
+	for k,v in FILE_EXTENSTIONS {
+		if v == ext {
+			return k
+		}
+	}
+
+	return .BINARY
+}
+
+file_exists :: proc(path: string) -> bool {
+	server := g_http_server
+	return os2.exists(filepath.join({server.public_dir, path}, context.temp_allocator)) \
+		&& os2.is_file(filepath.join({server.public_dir, path}, context.temp_allocator))
 }
 
 init_server :: proc(server: ^Server) {
@@ -171,70 +228,41 @@ serve :: proc(server: ^Server, keep_running: proc() -> bool = nil) {
 		log.info("Waiting for connection")
 
 		request := Request{}
-		defer {
-			for k, v in request.headers {
-				delete(k)
-				delete(v)
-			}
-			delete(request.headers)
-			delete(request.method)
-			delete(request.path)
-		}
+		defer delete_request(&request)
+
 		accept(server, &request)
 
 		log.info("Route: ", request.path)
 
 		if server.route_map[request.path] != nil {
 			response := server.route_map[request.path](&request)
-			defer {
-				// for k, v in response.headers {
-				// 	delete(k)
-				// 	delete(v)
-				// }
-				delete(response.headers)
-				free(response)
-			}
-			switch r in response.varient {
-			case ^TextResponse:
-				send(&request, r)
-			case ^BinaryResponse:
-				send(&request, r)
-			}
-		} else if os2.exists(filepath.join({server.public_dir, request.path}, context.temp_allocator)) &&
-		   os2.is_file(filepath.join({server.public_dir, request.path}, context.temp_allocator)) {
-			ext, _ := strings.to_lower(filepath.ext(request.path), context.temp_allocator)
-			switch (ext) {
-			case ".txt", ".html", ".xml", ".css", ".js":
+			defer delete_response(response)
+
+			send(&request, response)
+			
+		} else if file_exists(request.path) {
+			ext := get_filetype(request.path)
+			log.info(ext)
+			#partial switch (ext) {
+			case .HTML, .XML, .CSS, .JS, .TEXT:
 				{
 					response := create_text_file_response(request.path)
-					// defer free(response)
-					defer {
-						// for k, v in response.headers {
-						// 	delete(k)
-						// 	delete(v)
-						// }
-						delete(response.headers)
-						// delete(response.body)
-						free(response)
-					}
+					defer delete_response(response)
+					
 					send(&request, response)
 				}
 			case:
-				response := create_binary_response(request.path)
-				// defer free(response)
-				defer {
-					delete(response.headers)
-					// delete(response.body)
-					free(response)
+				{
+					response := create_binary_response(request.path)
+					defer delete_response(response)
+				
+					send(&request, response)
 				}
-				send(&request, response)
 			}
 		} else {
 			response := new_text_response()
-			defer {
-				delete(response.headers)
-				free(response)
-			}
+			defer delete_response(response)
+			
 			response.status = .NOT_FOUND
 			response.body = "<h1> Error: Resource not found </h1>"
 			send(&request, response)
@@ -252,7 +280,7 @@ create_template_response :: proc(name: string) -> ^TextResponse {
 	response.status = .OK
 	response.varient = response
 	init_default_response_headers(response)
-	response.headers["Content-Type"] = CONTENT_TYPES[".html"]
+	response.headers["Content-Type"] = CONTENT_TYPES[.HTML]
 	response.body = get_file_contents(path)
 
 	return response
@@ -260,10 +288,10 @@ create_template_response :: proc(name: string) -> ^TextResponse {
 
 create_binary_response :: proc(name: string) -> ^BinaryResponse {
 	path := filepath.join({g_http_server.public_dir, name}, context.temp_allocator)
-	ext, _ := strings.to_lower(filepath.ext(name), context.temp_allocator)
-
+	filetype := get_filetype(name)
+	
 	response := new_binary_response()
-	response.headers["Content-Type"] = CONTENT_TYPES[ext]
+	response.headers["Content-Type"] = CONTENT_TYPES[filetype]
 	response.body = get_file_bytes(path)
 
 	return response
@@ -271,10 +299,10 @@ create_binary_response :: proc(name: string) -> ^BinaryResponse {
 
 create_text_file_response :: proc(name: string) -> ^TextResponse {
 	path := filepath.join({g_http_server.public_dir, name}, context.temp_allocator)
-	ext, _ := strings.to_lower(filepath.ext(name))
-
+	filetype := get_filetype(name)
+	
 	response := new_text_response()
-	response.headers["Content-Type"] = CONTENT_TYPES[ext]
+	response.headers["Content-Type"] = CONTENT_TYPES[filetype]
 	response.body = get_file_contents(path)
 
 	return response
@@ -361,7 +389,6 @@ read :: proc(request: ^Request) {
 		request.headers[key] = value
 	}
 
-	// free_all(context.temp_allocator)
 }
 
 send :: proc(request: ^Request, response: ^Response) {
@@ -429,4 +456,3 @@ get_file_bytes :: proc(path: string) -> []byte {
 
 	return file_bytes
 }
-
